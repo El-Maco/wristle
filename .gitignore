@@ -1,0 +1,30 @@
+# Build output
+watch/build/
+*.apk
+*.idsig
+*.dex
+
+# Signing keys: never commit these
+*.keystore
+*.jks
+*.p12
+keystore-password.txt
+*-PRIVATE*
+
+# Release archives (published via GitHub Releases, not the repo)
+*.zip
+
+# Python
+desktop/.venv/
+__pycache__/
+*.pyc
+
+# Logs and recordings
+*.log
+*.wav
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

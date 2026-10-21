@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <!-- Swiping would cancel a press-and-hold; exit with the crown/side button instead. -->
+        <item name="android:windowSwipeToDismiss">false</item>
+    </style>
+</resources>
