@@ -14,6 +14,10 @@ How it works:
      the watch audio into a virtual audio cable that the app uses as its mic.
   4. When you stop, the shortcut is released and the app pastes at your cursor.
 
+With --voxtype, steps 3-4 are replaced: the audio is transcribed by the
+`voxtype` CLI and typed with `wtype`. No virtual cable, hotkey or dictation
+app is needed.
+
 Nothing leaves your network. Run with --help for options.
 """
 
@@ -27,9 +31,12 @@ import json
 import os
 import platform
 import secrets
+import shlex
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -242,6 +249,69 @@ class NullSink:
         pass
 
 
+def parse_transcript(stdout: str) -> str:
+    """Take the transcript out of `voxtype transcribe` stdout.
+
+    voxtype prints progress lines, a blank line, then the text. Keep everything
+    after the last "Processing ... samples ..." line so multiline text survives.
+    """
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("Processing ") and line.rstrip().endswith("..."):
+            return "\n".join(lines[i + 1:]).strip()
+    # Older/newer voxtype output without the marker: drop its known preamble.
+    keep = [line for line in lines
+            if not line.startswith(("Loading audio file:", "Audio format:", "Processing "))]
+    return "\n".join(keep).strip()
+
+
+class Voxtype:
+    """Transcribe raw 16 kHz PCM with the voxtype CLI, then type the text."""
+
+    def __init__(self, binary: str = "voxtype", type_cmd: str = "wtype -", timeout: int = 120):
+        self.binary = binary
+        self.type_cmd = shlex.split(type_cmd)
+        self.timeout = timeout
+
+    def run(self, pcm: bytes) -> bool:
+        if not pcm:
+            return False
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(WATCH_RATE)
+                w.writeframes(pcm)
+            proc = subprocess.run(
+                [self.binary, "-q", "transcribe", path],
+                capture_output=True, text=True, timeout=self.timeout,
+            )
+        except (OSError, subprocess.SubprocessError, wave.Error) as e:
+            log(f"! voxtype failed: {e}")
+            return False
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            log(f"! voxtype exited {proc.returncode}: {proc.stderr.strip()[-300:]}")
+            return False
+        text = parse_transcript(proc.stdout)
+        if not text:
+            log("! voxtype returned no text")
+            return False
+        try:
+            subprocess.run(self.type_cmd, input=text, text=True, timeout=30, check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"! typing failed: {e}")
+            return False
+        log(f"  typed {len(text)} characters")
+        return True
+
+
 HOSTAPI_PREFERENCE = ["Windows WASAPI", "MME", "Windows DirectSound", "Core Audio",
                       "PulseAudio", "ALSA", "JACK Audio Connection Kit"]
 
@@ -424,13 +494,14 @@ class Hotkey:
 
 class Dictation:
     def __init__(self, sink, hotkey: Hotkey, start_delay: float, tail: float,
-                 gain: float, save_dir: Path | None):
+                 gain: float, save_dir: Path | None, transcriber: Voxtype | None = None):
         self.sink = sink
         self.hotkey = hotkey
         self.start_delay = start_delay
         self.tail = tail
         self.gain = gain
         self.save_dir = save_dir
+        self.transcriber = transcriber
         self.lock = threading.Lock()
         self.owner = None
         self.resampler = None
@@ -442,18 +513,23 @@ class Dictation:
             if self.owner is not None:
                 return False
             self.owner = owner
-            self.resampler = LinearResampler(WATCH_RATE, self.sink.rate)
             self.raw = []
             self.started_at = time.monotonic()
-            self.sink.clear()
-        self.hotkey.press()
-        # Give the dictation app a moment to open its microphone before the speech arrives.
-        self.sink.write(np.zeros(int(self.start_delay * self.sink.rate), dtype=np.float32))
+            if self.transcriber is None:
+                self.resampler = LinearResampler(WATCH_RATE, self.sink.rate)
+                self.sink.clear()
+        if self.transcriber is None:
+            self.hotkey.press()
+            # Give the dictation app a moment to open its microphone before the speech arrives.
+            self.sink.write(np.zeros(int(self.start_delay * self.sink.rate), dtype=np.float32))
         log("● dictation started")
         return True
 
     def audio(self, owner, pcm: bytes):
         if self.owner is not owner:
+            return
+        if self.transcriber is not None:
+            self.raw.append(pcm)
             return
         x = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
         if self.gain != 1.0:
@@ -462,10 +538,25 @@ class Dictation:
             self.raw.append(pcm)
         self.sink.write(self.resampler.process(x))
 
+    def save_wav(self):
+        if not (self.save_dir and self.raw):
+            return
+        path = self.save_dir / time.strftime("watch-%Y%m%d-%H%M%S.wav")
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(WATCH_RATE)
+            w.writeframes(b"".join(self.raw))
+        log(f"  saved {path}")
+
     def finish(self, owner, cancel: bool = False):
         if self.owner is not owner:
             return
-        if not cancel:
+        ok = True
+        if self.transcriber is not None:
+            if not cancel:
+                ok = self.transcriber.run(b"".join(self.raw))
+        elif not cancel:
             deadline = time.monotonic() + 15
             while self.sink.queued_seconds() > 0.005 and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -474,17 +565,12 @@ class Dictation:
             self.sink.clear()
             self.hotkey.tap_escape()
             time.sleep(0.05)
-        self.hotkey.release()
+        if self.transcriber is None:
+            self.hotkey.release()
         seconds = time.monotonic() - self.started_at
-        if self.save_dir and self.raw:
-            path = self.save_dir / time.strftime("watch-%Y%m%d-%H%M%S.wav")
-            with wave.open(str(path), "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(WATCH_RATE)
-                w.writeframes(b"".join(self.raw))
-            log(f"  saved {path}")
-        log(f"■ dictation {'cancelled' if cancel else 'sent'} ({seconds:.1f}s)")
+        self.save_wav()
+        outcome = "cancelled" if cancel else ("sent" if ok else "failed")
+        log(f"■ dictation {outcome} ({seconds:.1f}s)")
         with self.lock:
             self.owner = None
 
@@ -781,6 +867,12 @@ def main():
     p.add_argument("--test-hotkey", action="store_true",
                    help="hold the shortcut for 4 s (speak into your normal mic) to check the dictation app reacts, then exit")
     p.add_argument("--dry-run", action="store_true", help="no audio device and no key presses (protocol testing)")
+    p.add_argument("--voxtype", action="store_true",
+                   help="transcribe each dictation with the voxtype CLI and type it with wtype "
+                        "(no virtual cable or hotkey)")
+    p.add_argument("--voxtype-bin", default="voxtype", help="voxtype executable (default: voxtype)")
+    p.add_argument("--type-cmd", default="wtype -",
+                   help="command that types text from stdin (default: 'wtype -')")
     p.add_argument("--background", action="store_true",
                    help="run without a console; log to listener.log in the settings folder")
     p.add_argument("--stop", action="store_true", help="stop a listener that is already running, then exit")
@@ -801,8 +893,13 @@ def main():
         sys.stdout = sys.stderr = f
 
     if args.list_devices:
+        if args.voxtype:
+            raise SystemExit("--list-devices is for the virtual-cable mode; --voxtype needs no audio device")
         list_devices()
         return
+
+    if args.voxtype and args.test_hotkey:
+        raise SystemExit("--test-hotkey is for the hotkey mode; drop one of the two flags")
 
     if args.test_hotkey:
         hk = Hotkey(args.hotkey)
@@ -818,28 +915,33 @@ def main():
     if SYSTEM == "Linux" and args.device == "pulse":
         os.environ.setdefault("PULSE_SINK", "wristle")  # the null sink from the README
 
+    transcriber = None
     sink = None
-    for attempt in range(30 if args.background else 1):
-        try:
-            sink = NullSink() if args.dry_run else DeviceSink(args.device)
-            break
-        except (Exception, SystemExit) as e:  # audio may not be ready yet right after login
-            if attempt == (29 if args.background else 0):
-                log(f"Audio device error: {e}")
-                raise
-            time.sleep(2)
+    if args.voxtype:
+        transcriber = Voxtype(args.voxtype_bin, args.type_cmd)
+        sink = NullSink(rate=WATCH_RATE)
+    else:
+        for attempt in range(30 if args.background else 1):
             try:
-                # PortAudio only lists devices when it starts, so restart it to see new ones.
-                import sounddevice as sd
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-    hotkey = Hotkey(args.hotkey, enabled=not args.dry_run)
+                sink = NullSink() if args.dry_run else DeviceSink(args.device)
+                break
+            except (Exception, SystemExit) as e:  # audio may not be ready yet right after login
+                if attempt == (29 if args.background else 0):
+                    log(f"Audio device error: {e}")
+                    raise
+                time.sleep(2)
+                try:
+                    # PortAudio only lists devices when it starts, so restart it to see new ones.
+                    import sounddevice as sd
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+    hotkey = Hotkey(args.hotkey, enabled=not (args.dry_run or args.voxtype))
     save_dir = Path(args.save_wav) if args.save_wav else None
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
-    dictation = Dictation(sink, hotkey, args.start_delay, args.tail, args.gain, save_dir)
+    dictation = Dictation(sink, hotkey, args.start_delay, args.tail, args.gain, save_dir, transcriber)
     paired = PairedWatches(config_dir() / "paired_watches.json")
     server = Server(dictation, paired, args.port, args.auto_pair)
     server.background = args.background
@@ -850,8 +952,11 @@ def main():
     threading.Thread(target=server.serve_tcp, daemon=True).start()
 
     print(f"Wristle listener {VERSION}")
-    print(f"  audio out : {sink.name}  →  choose this cable as your dictation app's microphone")
-    print(f"  shortcut  : {args.hotkey} (the app must use hold / push-to-talk mode)")
+    if transcriber:
+        print(f"  output    : {transcriber.binary} → {' '.join(transcriber.type_cmd)}")
+    else:
+        print(f"  audio out : {sink.name}  →  choose this cable as your dictation app's microphone")
+        print(f"  shortcut  : {args.hotkey} (the app must use hold / push-to-talk mode)")
     print(f"  listening : {', '.join(local_ips()) or 'all interfaces'} : {args.port} (discovery on UDP {UDP_PORT})")
     print("  Open Wristle on your watch. Ctrl+C to quit.\n")
 

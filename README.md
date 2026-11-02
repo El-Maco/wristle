@@ -2,7 +2,8 @@
 
 **Dictate into your PC from your wrist.** Wristle turns a Wear OS watch into a
 wireless push-to-talk microphone for the local dictation app you already use,
-such as [Hex](https://github.com/anomalyco/hex) or [Handy](https://github.com/cjpais/Handy).
+such as [Hex](https://github.com/anomalyco/hex), [Handy](https://github.com/cjpais/Handy)
+or [voxtype](https://voxtype.io).
 Hold the button on your watch (or tap it on your watch face), talk, and the text
 appears wherever your cursor is.
 
@@ -28,6 +29,7 @@ Wear OS watch ──Wi-Fi (LAN only)──▶ Wristle listener ──virtual aud
 - Finds your PC automatically on the local network; approve each new watch once
 - Audio is buffered while the watch reconnects, so the first words aren't lost
 - Can start silently at login on Windows
+- `--voxtype` mode for Linux: no virtual cable or hotkey needed
 - No cloud, no account, nothing saved unless you ask
 
 ## Compatibility
@@ -36,6 +38,7 @@ Wear OS watch ──Wi-Fi (LAN only)──▶ Wristle listener ──virtual aud
 | --- | --- |
 | **Watches** | **Tested: Pixel Watch 4.** Should work on any Wear OS 3+ watch with a microphone and Wi-Fi (Galaxy Watch 4 and newer, other Pixel Watches, OnePlus Watch 2, TicWatch Pro 5, …), but these are **not tested** yet. |
 | **Dictation apps** | Any app that (1) lets you choose the microphone and (2) records while a shortcut is held. **Tested: Hex on Windows.** Expected to work: Handy. |
+| **Voxtype** | Linux. `--voxtype` sends each dictation to the `voxtype` CLI and types the result with `wtype`; no virtual cable or hotkey. |
 | **Desktop** | **Tested: Windows 11.** macOS and Linux (X11) are supported in the code but **not tested** yet. Python 3.10+. |
 
 Only the setups marked **tested** have been tried. If you run Wristle on another
@@ -88,6 +91,22 @@ python wristle.py --list-devices   # the cable should be listed
 python wristle.py --test-hotkey    # your app's recording indicator should appear for 4 s
 ```
 
+**Voxtype (Linux, no virtual cable)**
+
+If you use [voxtype](https://voxtype.io), skip the cable and hotkey entirely:
+
+```sh
+desktop/start.sh --voxtype
+```
+
+(The first run installs only `numpy`; no virtual cable, `sounddevice` or `pynput`.)
+
+Each dictation is written to a temporary WAV, transcribed with
+`voxtype -q transcribe`, and typed with `wtype -`. It uses the engine and model
+in your voxtype config, and the voxtype daemon can keep running.
+Both `voxtype` and `wtype` must be in `PATH`. Use `--type-cmd` if you type with
+something else, e.g. `--type-cmd 'ydotool type --file -'`.
+
 ### 2. Watch
 
 Download `wristle-x.y.z.apk` from [Releases](https://github.com/unknownprocess/wristle/releases).
@@ -106,6 +125,9 @@ Wear OS can't install APKs by tapping them, so use ADB over Wi-Fi once:
 5. Turn Wireless debugging off again. It drains the battery.
 
 On a phone instead of a PC, apps like *Bugjaeger* can install the APK the same way.
+
+If the watch is not on the PC's LAN, relay ADB through the phone over Tailscale:
+see [phone/README.md](phone/README.md).
 
 ### 3. First use
 
@@ -206,7 +228,8 @@ New-NetFirewallRule -DisplayName "Wristle UDP" -Direction Inbound -Protocol UDP 
 - **Stream:** length-prefixed frames over TCP 47820 (hello, auth, start, 20 ms
   chunks of 16 kHz mono 16-bit PCM, end or cancel, pings, status).
 - **Desktop:** the audio is resampled to the cable's rate and played into it
-  while the shortcut is held.
+  while the shortcut is held. With `--voxtype`, it is written to a WAV,
+  transcribed by the voxtype CLI, and typed with `wtype`.
 - **Watch app:** plain Java with no AndroidX. The complication speaks the Wear
   OS complication binder protocol directly.
 
@@ -225,6 +248,9 @@ watch/build.sh          # → watch/build/wristle-<version>.apk
 The first build creates a signing key in `~/.wristle/`. **Back it up and never
 commit it.** Updates only install over an existing app if they're signed with
 the same key. You can also point `KEYSTORE` and `KEYSTORE_PASS` at your own key.
+The published APK is signed with a different key, so the first local build must
+replace it (uninstall first, then install; see
+[phone/README.md](phone/README.md) for the phone workflow).
 
 **Releases via GitHub Actions (optional):** add the repository secrets `KEYSTORE_BASE64`
 (your keystore, base64-encoded) and `KEYSTORE_PASS`, push a tag such as `v0.2.0`,
